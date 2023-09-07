@@ -1,0 +1,1212 @@
+library(haven)
+library("tidyverse")
+library(ggplot2)
+library(tableone) #Creates table of balance between treated and untreated
+library("MatchIt") #Performs propensity score matching for m.data
+library("Hmisc") #Contributes to imputation
+library("cobalt") #Provides balance metrics
+library("DMwR2") #Performs knn imputation
+library(mice, warn.conflicts = FALSE) #For Multiple Imputation
+library(randomForest) #For generating RF propensity score
+library("surveyCV")
+library(caret) #Used for tuning RF
+library(rlang)
+library(MASS)
+library(rbounds) #Used for sensitivity analysis
+library(purrr)
+library(optmatch) #Used in performing matching to perform optimal/full matching
+library("survey") #Used to incorporate survey weights
+library('EValue') #Used to generate Evalue (sensitivity metric)
+library("clarify") #Used to calculate ATT
+library("marginaleffects") #Used to calculate ATE
+library(corrplot) #Makes correaltion plot for collinearity
+library(dplyr)
+library(catboost) #Used for CatBoost
+
+getwd()
+setwd("/Users/nathan/R")
+source("diss_functions.R")
+#Opening steps
+data <- read_dta('MICS_ZWE_Data.dta')
+data <- as.data.frame(data)
+data = filter(data, age_c > 9 & age_c < 20) #remove irrelevant ages
+data <- data[, !(names(data) %in% c("HHID", "ID"))] #Remove indivudal and household IDs
+data$misc12mn_i <- pmax(data$pens12mn_i, data$hlth12mn_i, data$oth12mn_i)
+#Operation Toggle
+doKNNImp <- FALSE; doMIIMp <- FALSE; #KNN imputation and multiple imputation
+doAICTest <- FALSE; testResiduals = FALSE; #Stepwise AIC and checks propGLM residuals
+hypertuningRF = FALSE; RFPCA = FALSE; genRF = FALSE; #Random forest tuning, creation, and ps
+catBoostBaseline = FALSE; genCat = FALSE; #CatBooost hyperparameters and ps
+genMatchesATE = FALSE; genMatchesATT = FALSE; #Creation of matches for ATT and ATE
+
+matchSummary <- FALSE; oneTable <- TRUE; #Balance metrics summary with interactions
+plotLove = FALSE;
+
+outcomeVariable <- "schcyr_i"
+# Categories: school (schlsprt_i), food (fdagr12mn_i), miscellaneous (misc12mn_i), 
+# cash (data$csh12mn_i), any (sp12mn_i), any minus school (stfr12mn_i)
+
+treatmentVariable1 <- "fdagr12mn_i"
+treatmentVariable2 <- "misc12mn_i"
+treatmentVariable3 <- "csh12mn_i"
+
+parameters <- colnames(data)
+
+
+#Treatment Variables: miscSupport, SchoolSupport, fdagr12mn_i
+#Outcome Variables: schcyr_i
+treatVars <- c('schlsprt_i','stfr12mn_i', 'sp12mn_i', 'csh12mn_i', 'fdagr12mn_i', 'hlth12mn_i', 'pens12mn_i', 'oth12mn_i', 'misc12mn_i')
+inputVars <- c('age_c', 'female_i', 'evrenrl_i', 'hgstlvl_i', 'hgstgrd_c', 'hgstgrdcmp_i', 'schlcyrl_i', 'schlcyrgrd_c', 'schcyrlg_c', 'schpvyr_i', 'schpvyrl_i', 'schpvyrgrd_c', 'schpvyrlg_c', 'headage_c', 'headsex_i', 'headedu_i', 'headreligion_i', 'caredis_i', 'livarr_i', 'relation_i', 'orph_cat', 'hhsize_c', 'area_i', 'province_i', 'wscore', 'windex5', 'hhweight', 'psu', 'stratum')
+variables_to_remove <- c('schlcyrl_i', 'schlcyrgrd_c', 'schcyrlg_c')
+inputVars <- inputVars[!(inputVars %in% variables_to_remove)]
+
+integerVars <- c("age_c", "female_i", "evrenrl_i", "hgstlvl_i", "hgstgrd_c", "hgstgrdcmp_i", "schcyr_i", "schlcyrl_i", "schlcyrgrd_c", "schcyrlg_c", "schpvyr_i", "schpvyrl_i", "schpvyrgrd_c", "schpvyrlg_c", "headage_c", "headsex_i", "headedu_i", "headreligion_i", "caredis_i", "livarr_i", "relation_i", "orph_cat", "hhsize_c", "area_i", "province_i", "windex5", "schlsprt_i", "stfr12mn_i", "sp12mn_i", "csh12mn_i", "fdagr12mn_i", "hlth12mn_i", "pens12mn_i", "oth12mn_i", "psu", "stratum","misc12mn_i")
+
+#Variable details
+summary(data)
+get_column_types(data)
+
+##Multiple Imputation
+NAdata <- apply(data, 2, function(x){ sum(is.na(x)) })
+if(doMIIMp){
+  roundVars <- names(NAdata[unlist(NAdata) > 1])
+  data.mi <- multiple_imputation(data, method = "norm", m = 5, maxit = 50, 
+                                 seed = 123, remove_collinear = FALSE, round_vars = roundVars)
+  data.mi <- round_integer_columns_in_mi(imputed_data = data.mi, original_data = data, integer_columns = integerVars)
+  write.csv(data.mi, file = "data.mi.csv")
+}else{
+  data.mi <- read.csv("data.mi.csv")
+}
+
+
+#Performs KNN with k=1
+if(doKNNImp){
+  data.knnimp <- knnImputation(data, k=1, meth = "weighAvg") #Removes NA values with KNN
+  write.csv(data.knnimp, file = "data.knnimp.csv")
+}else{
+  data.knnimp <- read.csv("data.knnimp.csv")
+}
+
+#Calculates collinearity between variables, not necessary for propnesity scoring
+cor_matrix <- cor(as.data.frame(lapply(data.mi[, inputVars], as.numeric)))
+corrplot(cor_matrix, method = "circle")
+vif <- 1 / (1 - cor_matrix^2)
+
+## Assigns all categorical variables as factors
+data.mi$female_i <- factor(data.mi$female_i, levels = c(1, 2), labels = c("Male", "Female"))
+data.mi$evrenrl_i <- factor(data.mi$evrenrl_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$hgstlvl_i <- factor(data.mi$hgstlvl_i,
+                            levels = 0:11,
+                            labels = c("None", "ECE", "Primary", "Vocational (Nation Certificate)",
+                                       "Lower secondary", "Upper secondary",
+                                       "Vocational (Certificate)", "Vocational (Apprenticeship)",
+                                       "Tertiary (Short cycle)", "Tertiary (Higher national diploma)",
+                                       "Tertiary (master)", "Doctorate"))
+data.mi$hgstgrdcmp_i <- factor(data.mi$hgstgrdcmp_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$schcyr_i <- factor(data.mi$schcyr_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$schlcyrl_i <- factor(data.mi$schlcyrl_i,
+                             levels = 0:11,
+                             labels = c("None", "ECE", "Primary", "Vocational (Nation Certificate)",
+                                        "Lower secondary", "Upper secondary",
+                                        "Vocational (Certificate)", "Vocational (Apprenticeship)",
+                                        "Tertiary (Short cycle)", "Tertiary (Higher national diploma)",
+                                        "Tertiary (master)", "Doctorate"))
+data.mi$schpvyr_i <- factor(data.mi$schpvyr_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$schpvyrl_i <- factor(data.mi$schpvyrl_i,
+                             levels = 0:11,
+                             labels = c("None", "ECE", "Primary", "Vocational (Nation Certificate)",
+                                        "Lower secondary", "Upper secondary",
+                                        "Vocational (Certificate)", "Vocational (Apprenticeship)",
+                                        "Tertiary (Short cycle)", "Tertiary (Higher national diploma)",
+                                        "Tertiary (master)", "Doctorate"))
+data.mi$headsex_i <- factor(data.mi$headsex_i, levels = c(1, 2), labels = c("Male", "Female"))
+data.mi$headedu_i <- factor(data.mi$headedu_i, levels = c(0, 1), labels = c("None/Primary", "Secondary/higher"))
+data.mi$headreligion_i <- factor(data.mi$headreligion_i,
+                                 levels = 1:10,
+                                 labels = c("Roman catholic", "Protestant", "Pentecostal", 
+                                            "Apostolic sect", "Zion", "Other christian",
+                                            "Islam", "Traditional", "No religion", "Other religion"))
+data.mi$caredis_i <- factor(data.mi$caredis_i, levels = c(0, 1), labels = c("Disabled", "Not Disabled"))
+data.mi$livarr_i <- factor(data.mi$livarr_i, levels = c(0, 1), labels = c("Lives w/ parent", "Lives w/ relatives"))
+data.mi$relation_i <- factor(data.mi$relation_i,
+                             levels = c(1:14, 96),
+                             labels = c("Head", "Spouse", "Son /daughter", 
+                                        "Son-in-law/daughter-in-law", "Grandchild", "Parent",
+                                        "Parent-in-law", "Brother/sister","Brother-in-law/sister-in-law", 
+                                        "Uncle/aunt", "Niece/nephew", "Other relative", "Adopted/foster/stepchild",
+                                        "Servant (live-in)", "Other (not related)"))
+data.mi$orph_cat <- factor(data.mi$orph_cat, levels = c(0, 1, 2), labels = c("Both Parents", "Single orphan", "Double orphan"))
+data.mi$area_i <- factor(data.mi$area_i, levels = c(0, 1), labels = c("Urban", "Rural"))
+data.mi$province_i <- factor(data.mi$province_i,
+                             levels = 0:9,
+                             labels = c("Manicaland", "Mashonaland central", "Mashonaland east", 
+                                        "Mashonaland west", "Matabeleland north", "Matabeleland south",
+                                        "Midlands", "Masvingo", "Harare", "Bulawayo"))
+data.mi$windex5 <- factor(data.mi$windex5,
+                          levels = 1:5,
+                          labels = c("Poorest", "Second", "Third", "Fourth", "Richest"))
+data.mi$schlsprt_i <- factor(data.mi$schlsprt_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$stfr12mn_i <- factor(data.mi$stfr12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$sp12mn_i <- factor(data.mi$sp12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$csh12mn_i <- factor(data.mi$csh12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$fdagr12mn_i <- factor(data.mi$fdagr12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$hlth12mn_i <- factor(data.mi$hlth12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$pens12mn_i <- factor(data.mi$pens12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$oth12mn_i <- factor(data.mi$oth12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+data.mi$misc12mn_i <- factor(data.mi$misc12mn_i, levels = c(0, 1), labels = c("No", "Yes"))
+
+##Unmatched table One
+if(oneTable){
+  oneTableVar <- c('age_c', 'female_i', 'evrenrl_i', 'schpvyr_i', 'headsex_i', 'orph_cat', 'province_i', 'wscore', 'windex5', 'hhweight')
+  oneTablefactorVar <- c('female_i', 'evrenrl_i', 'schpvyr_i', 'headsex_i', 'orph_cat', 'province_i', 'windex5')
+  
+  food_tableOneU <- one_table(data.mi, oneTableVar, oneTablefactorVar, treatmentVariable1)
+  write.csv(food_tableOneU, file = "food_tableOne_before_matching.csv")
+  misc_tableOneU <- one_table(data.mi, oneTableVar, oneTablefactorVar, treatmentVariable2)
+  write.csv(food_tableOneU, file = "misc_tableOne_before_matching.csv")
+  cash_tableOneU <- one_table(data.mi, oneTableVar, oneTablefactorVar, treatmentVariable3)
+  write.csv(food_tableOneU, file = "cash_tableOne_before_matching.csv")
+}
+
+#Checks whether any Na values are still in data
+NAdata.mi <- apply(data.mi, 2, function(x){ sum(is.na(x)) })
+if (any(NAdata.mi != 0)) stop("Error: Missing values found in data.mi")
+
+#Formula string of relevant covariates for calculating treatment likelihood
+formula_str1 <- paste(treatmentVariable1, " ~ age_c + female_i + evrenrl_i + hgstlvl_i + hgstgrd_c + hgstgrdcmp_i + schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + headage_c + headsex_i + headedu_i + headreligion_i + caredis_i + livarr_i + relation_i + orph_cat + hhsize_c + area_i + province_i + wscore + windex5 + hhweight + psu")
+formula_str2 <- paste(treatmentVariable2, " ~ age_c + female_i + evrenrl_i + hgstlvl_i + hgstgrd_c + hgstgrdcmp_i + schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + headage_c + headsex_i + headedu_i + headreligion_i + caredis_i + livarr_i + relation_i + orph_cat + hhsize_c + area_i + province_i + wscore + windex5 + hhweight + psu")
+formula_str3 <- paste(treatmentVariable3, " ~ age_c + female_i + evrenrl_i + hgstlvl_i + hgstgrd_c + hgstgrdcmp_i + schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + headage_c + headsex_i + headedu_i + headreligion_i + caredis_i + livarr_i + relation_i + orph_cat + hhsize_c + area_i + province_i + wscore + windex5 + hhweight + psu")
+
+#Creates a data list without outcome or any treatment paramters as covariates
+data_subset1 <- data.mi[, c(inputVars, treatmentVariable1)]
+data_subset2 <- data.mi[, c(inputVars, treatmentVariable2)]
+data_subset3 <- data.mi[, c(inputVars, treatmentVariable3)]
+
+##Calculates model based on optimal stepwise AIC
+if(doAICTest){
+  #Uses baseline formula as starting point
+  initial_model <- glm(formula = as.formula(formula_str), family = binomial(logit), data = data.mi)
+  #Considers interactions and quadratic terms
+  formula_str_polynomial <- paste(treatmentVariable3, " ~ (age_c + female_i + evrenrl_i + hgstlvl_i + hgstgrd_c + hgstgrdcmp_i + schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + headage_c + headsex_i+ headedu_i + headreligion_i + caredis_i + livarr_i + relation_i + orph_cat + hhsize_c + area_i + province_i + wscore + windex5 + hhweight + psu)^2")
+  #Perform stepwise model selection with AIC using forward selection
+  final_model <- stepAIC(initial_model, direction = "forward", scope = list(lower = initial_model$formula, upper = formula(formula_str_polynomial)))
+  summary(final_model)
+}else{
+  # Using paste0 with collapse argument to create a single-line formula string
+  optFormula_str <- paste0(treatmentVariable3, " ~ age_c + female_i + evrenrl_i + hgstlvl_i + ",
+                           "hgstgrd_c + hgstgrdcmp_i + schlcyrl_i + schlcyrgrd_c + schcyrlg_c + ",
+                           "schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + headage_c + ",
+                           "headsex_i + headedu_i + headreligion_i + caredis_i + livarr_i + ",
+                           "relation_i + orph_cat + hhsize_c + area_i + province_i + ",
+                           "wscore + windex5 + hhweight + psu + area_i:windex5 + area_i:wscore + ",
+                           "headage_c:area_i + headage_c:hhsize_c + hhsize_c:area_i + ",
+                           "hhsize_c:windex5 + area_i:hhweight + headsex_i:windex5 + ",
+                           "headage_c:wscore + headedu_i:psu + headedu_i:province_i + ",
+                           "hhweight:psu + schlcyrgrd_c:psu + age_c:hgstgrdcmp_i + evrenrl_i:hgstgrd_c + ",
+                           "schcyrlg_c:hhweight + schcyrlg_c:relation_i + headsex_i:area_i + ",
+                           "province_i:hhweight + hgstgrd_c:headage_c + schlcyrgrd_c:windex5 + ",
+                           "relation_i:windex5 + female_i:relation_i + livarr_i:hhsize_c + ",
+                           "hgstgrd_c:windex5 + area_i:psu + province_i:windex5 + relation_i:psu + ",
+                           "schcyrlg_c:hhsize_c + headedu_i:hhsize_c + headedu_i:area_i + ",
+                           "age_c:hhweight + headedu_i:caredis_i + headage_c:headedu_i + ",
+                           "headreligion_i:caredis_i + female_i:evrenrl_i + female_i:windex5 + ",
+                           "female_i:area_i + age_c:hgstgrd_c + schpvyrgrd_c:headedu_i + ",
+                           "headreligion_i:orph_cat + headreligion_i:hhweight + evrenrl_i:headsex_i + ",
+                           "evrenrl_i:headreligion_i + schcyrlg_c:headsex_i + hgstlvl_i:headsex_i + ",
+                           "schpvyr_i:schpvyrl_i + hgstgrd_c:hhsize_c + schpvyrgrd_c:windex5 + ",
+                           "headedu_i:relation_i + headsex_i:livarr_i + female_i:schpvyrgrd_c + ",
+                           "schlcyrgrd_c:headage_c + age_c:schlcyrgrd_c + hgstlvl_i:hgstgrdcmp_i + ",
+                           "hgstgrdcmp_i:headedu_i + female_i:schpvyr_i + headreligion_i:province_i + ",
+                           "headreligion_i:psu + headreligion_i:windex5 + schpvyrlg_c:headreligion_i + ",
+                           "age_c:relation_i + orph_cat:province_i + headsex_i:orph_cat + ",
+                           "evrenrl_i:relation_i + evrenrl_i:schpvyrl_i + evrenrl_i:hgstgrdcmp_i + ",
+                           "evrenrl_i:hhweight + schlcyrgrd_c:province_i + headedu_i:livarr_i")
+}
+
+##RF
+genFormula1 <- as.formula(paste(treatmentVariable1, "~.", sep = ""))
+genFormula2 <- as.formula(paste(treatmentVariable2, "~.", sep = ""))
+genFormula3 <- as.formula(paste(treatmentVariable3, "~.", sep = ""))
+
+train_index1 <- sample(1:nrow(data_subset1), 0.8 * nrow(data_subset1))  # 80% of data for training
+train_index2 <- sample(1:nrow(data_subset2), 0.8 * nrow(data_subset2))
+train_index3 <- sample(1:nrow(data_subset3), 0.8 * nrow(data_subset3))
+
+train_data1 <- data_subset1[train_index1, ]
+train_data2 <- data_subset2[train_index2, ]
+train_data3 <- data_subset3[train_index3, ]
+
+test_data1 <- data_subset1[-train_index1, ]
+test_data2 <- data_subset2[-train_index2, ]
+test_data3 <- data_subset3[-train_index3, ]
+
+#Creates train and test sets
+featuresRF1 <- as.data.frame(data_subset1[, -which(names(data_subset1) %in% treatmentVariable1)])
+featuresRF2 <- as.data.frame(data_subset2[, -which(names(data_subset2) %in% treatmentVariable2)])
+featuresRF3 <- as.data.frame(data_subset3[, -which(names(data_subset3) %in% treatmentVariable3)])
+
+#
+labelsRF1 <- data_subset1[[treatmentVariable1]]
+labelsRF2 <- data_subset2[[treatmentVariable2]]
+labelsRF3 <- data_subset3[[treatmentVariable3]]
+
+#Creating train labels, to enable use of genformula
+train_featuresRF1 <- featuresRF1[train_index1, ]
+train_featuresRF2 <- featuresRF2[train_index2, ]
+train_featuresRF3 <- featuresRF3[train_index3, ]
+
+train_labelsRF1 <- labelsRF1[train_index1]
+train_labelsRF2 <- labelsRF2[train_index2]
+train_labelsRF3 <- labelsRF3[train_index3]
+
+#Creating test features and labels
+test_featuresRF1 <- featuresRF1[-train_index1, ]
+test_featuresRF2 <- featuresRF2[-train_index2, ]
+test_featuresRF3 <- featuresRF3[-train_index3, ]
+
+#Test labels for each treatment as the outcome
+test_labelsRF1 <- labelsRF1[-train_index1]
+test_labelsRF2 <- labelsRF2[-train_index2]
+test_labelsRF3 <- labelsRF3[-train_index3]
+
+#PCA
+if(RFPCA){
+  #Creating preprocess pipeline
+  rfc_pipe1 <- preProcess(train_data1[, inputVars], method = c("center", "scale", "pca"))
+  rfc_pipe2 <- preProcess(train_data2[, inputVars], method = c("center", "scale", "pca"))
+  rfc_pipe3 <- preProcess(train_data3[, inputVars], method = c("center", "scale", "pca"))
+  
+  trainTransformed1 <- predict(rfc_pipe1, train_data1[, inputVars])
+  trainTransformed2 <- predict(rfc_pipe2, train_data2[, inputVars])
+  trainTransformed3 <- predict(rfc_pipe3, train_data3[, inputVars])
+  
+  testTransformed1 <- predict(rfc_pipe1, test_data1[, inputVars])
+  testTransformed2 <- predict(rfc_pipe2, test_data2[, inputVars])
+  testTransformed3 <- predict(rfc_pipe3, test_data3[, inputVars])
+  
+  #PCA transformed random forest for each treatment formula
+  rf_pca1 <- randomForest(trainTransformed1, train_data1[[treatmentVariable1]])
+  rf_pca2 <- randomForest(trainTransformed2, train_data2[[treatmentVariable2]])
+  rf_pca3 <- randomForest(trainTransformed3, train_data3[[treatmentVariable3]])
+  
+  #Generates untransformed random forest for each treatment
+  rf_original1 <- randomForest(as.formula(formula_str1), data=train_data1)
+  rf_original2 <- randomForest(as.formula(formula_str2), data=train_data2)
+  rf_original3 <- randomForest(as.formula(formula_str3), data=train_data3)
+  
+  #Creating predictions on untransformed data for each treatment
+  predictOriginal1 <- predict(rf_original1, test_data1)
+  predictOriginal2 <- predict(rf_original2, test_data2)
+  predictOriginal3 <- predict(rf_original3, test_data3)
+  
+  #Creating predictions on transformed data for each treatment
+  predictPCA1 <- predict(rf_pca1, testTransformed1)
+  predictPCA2 <- predict(rf_pca2, testTransformed2)
+  predictPCA3 <- predict(rf_pca3, testTransformed3)
+  
+  #Confusion matrices for untransformed predictions
+  rf_original_cf1 <- confusionMatrix(predictOriginal1, test_data1[[treatmentVariable1]])
+  draw_confusion_matrix(rf_original_cf1, treatment = "FOOD SUPPORT CONFUSION MATRIX")
+  rf_original_cf2 <- confusionMatrix(predictOriginal2, test_data2[[treatmentVariable2]])
+  draw_confusion_matrix(rf_original_cf2, treatment = "MISC SUPPORT CONFUSION MATRIX")
+  rf_original_cf3 <- confusionMatrix(predictOriginal3, test_data3[[treatmentVariable3]])
+  draw_confusion_matrix(rf_original_cf3, treatment = "CASH SUPPORT CONFUSION MATRIX")
+  
+  #Confusion matrices for transformed predictions
+  rf_pca_cf1 <- confusionMatrix(predictPCA1, test_data1[[treatmentVariable1]])
+  draw_confusion_matrix(rf_pca_cf1, treatment = "FOOD SUPPORT PCA CONFUSION MATRIX")
+  rf_pca_cf2 <- confusionMatrix(predictPCA2, test_data2[[treatmentVariable2]])
+  draw_confusion_matrix(rf_pca_cf2, treatment = "MISC SUPPORT PCA CONFUSION MATRIX")
+  rf_pca_cf3 <- confusionMatrix(predictPCA3, test_data3[[treatmentVariable3]])
+  draw_confusion_matrix(rf_pca_cf3, treatment = "CASH SUPPORT PCA CONFUSION MATRIX")
+  
+  # Define parameter grid
+  param_grid <- expand.grid(.mtry = seq(1, length(inputVars), by = 2))
+  pca_grid <- expand.grid(.mtry = seq(1, length(inputVars), by = 2))
+  rfc_param_grid_df <- rbind(param_grid, pca_grid)
+  
+  set.seed(123) # for reproducibility
+  
+  #Creating cross validation folds
+  cv_folds1 <- createFolds(data_subset1[[treatmentVariable1]], k = 5, returnTrain = TRUE)
+  cv_folds2 <- createFolds(data_subset2[[treatmentVariable2]], k = 5, returnTrain = TRUE)
+  cv_folds3 <- createFolds(data_subset3[[treatmentVariable3]], k = 5, returnTrain = TRUE)
+  tuneGrid <- expand.grid(.mtry = c(1, 5, 12, 20))
+  
+  ctrl1 <- trainControl(method = "cv",
+                        number = 5,
+                        search = 'grid',
+                        classProbs = TRUE,
+                        savePredictions = "final",
+                        index = cv_folds1,
+                        summaryFunction = twoClassSummary)
+  
+  ctrl2 <- trainControl(method = "cv",
+                        number = 5,
+                        search = 'grid',
+                        classProbs = TRUE,
+                        savePredictions = "final",
+                        index = cv_folds2,
+                        summaryFunction = twoClassSummary)
+  
+  ctrl3 <- trainControl(method = "cv",
+                        number = 5,
+                        search = 'grid',
+                        classProbs = TRUE,
+                        savePredictions = "final",
+                        index = cv_folds3,
+                        summaryFunction = twoClassSummary)
+  
+  ntrees <- c(250, 500, 1000, 1500, 2000)    
+  nodesize <- c(1, 2, 4, 5, 7)
+  params <- expand.grid(ntrees = ntrees, nodesize = nodesize)
+  
+  #Testing hyperparameters using train
+  store_maxnode1 <- vector("list", nrow(params))
+  store_maxnode2 <- vector("list", nrow(params))
+  store_maxnode3 <- vector("list", nrow(params))
+  
+  for(i in 1:nrow(params)){
+    nodesize <- params[i,2]
+    ntree <- params[i,1]
+    set.seed(1234)
+    rf_model1 <- train(genFormula1,
+                       data = data_subset1,
+                       method = "rf",
+                       importance=TRUE,
+                       metric = "ROC",
+                       tuneGrid = tuneGrid,
+                       trControl = ctrl1,
+                       ntree = ntree,
+                       nodesize = nodesize)
+    store_maxnode1[[i]] <- rf_model1
+    
+    rf_model2 <- train(genFormula2,
+                       data = data_subset2,
+                       method = "rf",
+                       importance=TRUE,
+                       metric = "ROC",
+                       tuneGrid = tuneGrid,
+                       trControl = ctrl2,
+                       ntree = ntree,
+                       nodesize = nodesize)
+    store_maxnode2[[i]] <- rf_model2
+    
+    rf_model3 <- train(genFormula3,
+                       data = data_subset3,
+                       method = "rf",
+                       importance=TRUE,
+                       metric = "ROC",
+                       tuneGrid = tuneGrid,
+                       trControl = ctrl3,
+                       ntree = ntree,
+                       nodesize = nodesize)
+    store_maxnode3[[i]] <- rf_model3
+  }
+  
+  #Renaming hyperparameter list for clarity
+  names(store_maxnode1) <- paste("ntrees:", params$ntrees, "nodesize:", params$nodesize)
+  names(store_maxnode2) <- paste("ntrees:", params$ntrees, "nodesize:", params$nodesize)
+  names(store_maxnode3) <- paste("ntrees:", params$ntrees, "nodesize:", params$nodesize)
+  
+  #Combing results
+  results_mtry1 <- resamples(store_maxnode1)
+  results_mtry2 <- resamples(store_maxnode2)
+  results_mtry3 <- resamples(store_maxnode3)
+  
+  #Returning best average performances
+  optRF1 <- lapply(store_maxnode1, function(x) x$results[x$results$ROC == max(x$results$ROC),])
+  optRF2 <- lapply(store_maxnode2, function(x) x$results[x$results$ROC == max(x$results$ROC),])
+  optRF3 <- lapply(store_maxnode3, function(x) x$results[x$results$ROC == max(x$results$ROC),])
+}
+
+# Hyperparameter tuning tuneRF
+if(hypertuningRF){
+  mtry_values <- seq(1, ncol(train_data1) - 1)  # All predictor variables except the response variable
+  rf_model1 <- tuneRF(
+    x = train_data1[, setdiff(names(train_data1), c(treatVars, outcomeVariable))],  # Exclude the response variable from the predictors
+    y = train_data1[[treatmentVariable1]],
+    stepFactor = 2,   # Step size for mtry (default is 1)
+    improve = 0.05,   # Minimum improvement required for stopping the search (default is 0.01)
+    ntreeTry = 500,   # Number of trees to grow for each mtry (default is 100)
+    trace = TRUE,     # Print progress during the search (default is FALSE)
+    plot = TRUE       # Plot the tuning results (default is FALSE)
+  )
+  
+  rf_model2 <- tuneRF(
+    x = train_data2[, setdiff(names(train_data2), c(treatVars, outcomeVariable))],  # Exclude the response variable from the predictors
+    y = train_data2[[treatmentVariable2]], stepFactor = 2, improve = 0.05, 
+    ntreeTry = 500, trace = TRUE, plot = TRUE)
+  
+  rf_model3 <- tuneRF(
+    x = train_data3[, setdiff(names(train_data3), c(treatVars, outcomeVariable))],  # Exclude the response variable from the predictors
+    y = train_data3[[treatmentVariable3]], stepFactor = 2, improve = 0.05, 
+    ntreeTry = 500, trace = TRUE, plot = TRUE)
+}
+numTree <- 500; numNode <- 1; 
+numMtry1 <- 20; numMtry2 <- 26; numMtry3 <- 20;#mtry optimal food:26, misc:26, cash:20
+##Random Forest
+if(genRF){
+  #Generates random forest, with survey weights as sample weights, default nodesize and ntrees, tuned mtry
+  propScoreRF1 <- randomForest(genFormula1, data=data_subset1,
+                               nodesize = numNode, mtry = numMtry1,
+                               ntree = numTree, importance = TRUE,
+                               do.trace = 100, sample_weight=data_subset1$hhweight)
+  
+  propScoreRF2 <- randomForest(genFormula2, data=data_subset2,
+                               nodesize = numNode, mtry = numMtry2,
+                               ntree = numTree, importance = TRUE,
+                               do.trace = 100, sample_weight=data_subset2$hhweight)
+  
+  propScoreRF3 <- randomForest(genFormula3, data=data_subset3,
+                               nodesize = numNode, mtry = numMtry3,
+                               ntree = numTree, importance = TRUE,
+                               do.trace = 100, sample_weight=data_subset3$hhweight)
+  
+  saveRDS(propScoreRF1, file = "food_propScoreRF.rds")
+  saveRDS(propScoreRF2, file = "misc_propScoreRF.rds")
+  saveRDS(propScoreRF3, file = "cash_propScoreRF.rds")
+}else{
+  propScoreRF1 <- readRDS("food_propScoreRF.rds")
+  propScoreRF2 <- readRDS("misc_propScoreRF.rds")
+  propScoreRF3 <- readRDS("cash_propScoreRF.rds")
+}
+#Estimates propensity score using fraction of votes recieved
+estPropScoreRF1 <- propScoreRF1$votes[,2] # Estimated PS RF
+estPropScoreRF2 <- propScoreRF2$votes[,2] # Estimated PS RF
+estPropScoreRF3 <- propScoreRF3$votes[,2] # Estimated PS RF
+
+
+##Boosted Cat
+data_subset1 <- convert_yes_no_to_binary(data_subset1, columns_to_convert = treatmentVariable1)
+data_subset2 <- convert_yes_no_to_binary(data_subset2, columns_to_convert = treatmentVariable2)
+data_subset3 <- convert_yes_no_to_binary(data_subset3, columns_to_convert = treatmentVariable3)
+
+#Creates features and labels, along with catboost loadpool
+features1 <- as.data.frame(data_subset1[, -which(names(data_subset1) %in% treatmentVariable1)])
+features2 <- as.data.frame(data_subset2[, -which(names(data_subset2) %in% treatmentVariable2)])
+features3 <- as.data.frame(data_subset3[, -which(names(data_subset3) %in% treatmentVariable3)])
+
+labels1 <- data_subset1[[treatmentVariable1]]
+labels2 <- data_subset2[[treatmentVariable2]]
+labels3 <- data_subset3[[treatmentVariable3]]
+
+treat_pool1 <- catboost.load_pool(data = features1, label = labels1)
+treat_pool2 <- catboost.load_pool(data = features2, label = labels2)
+treat_pool3 <- catboost.load_pool(data = features3, label = labels3)
+
+#Creates train features and labels, along with loadpool
+train_index1 <- sample(1:nrow(data_subset1), 0.8 * nrow(data_subset1))  # 80% of data for training
+train_index2 <- sample(1:nrow(data_subset2), 0.8 * nrow(data_subset2))
+train_index3 <- sample(1:nrow(data_subset3), 0.8 * nrow(data_subset3))
+
+#Train features and labels
+train_features1 <- features1[train_index1, ]
+train_features2 <- features2[train_index2, ]
+train_features3 <- features3[train_index3, ]
+
+train_labels1 <- labels1[train_index1]
+train_labels2 <- labels2[train_index2]
+train_labels3 <- labels3[train_index3]
+
+#Creates test features and labels, along with loadpool
+test_features1 <- features1[-train_index1, ]
+test_features2 <- features2[-train_index2, ]
+test_features3 <- features3[-train_index3, ]
+
+test_labels1 <- labels1[-train_index1]
+test_labels2 <- labels2[-train_index2]
+test_labels3 <- labels3[-train_index3]
+
+#Creating pools for hyperparameter tuning
+train_pool1 <- catboost.load_pool(data = train_features1, label = train_labels1)
+train_pool2 <- catboost.load_pool(data = train_features2, label = train_labels2)
+train_pool3 <- catboost.load_pool(data = train_features3, label = train_labels3)
+
+test_pool1 <- catboost.load_pool(data = test_features1, label = test_labels1)
+test_pool2 <- catboost.load_pool(data = test_features2, label = test_labels2)
+test_pool3 <- catboost.load_pool(data = test_features3, label = test_labels3)
+
+#Building Model
+if(catBoostBaseline){
+  #CatBoost hyperparameter tuning
+  # Define the grid of hyperparameters to be tested
+  grid <- expand.grid(depth = c(4, 7, 8, 9, 12),
+                      learning_rate = c(0.1, 0.15, 0.25, 0.3),
+                      iterations = 350,
+                      l2_leaf_reg = c(0.2, 0.3, 0.5, 0.8, 1.5),
+                      rsm = c(0.3, 0.5, 0.7, 0.9, 0.95),
+                      border_count = 64)
+  
+  # Train control settings (cross-validation)
+  #Cross validation with 5 folds with parallel execution
+  fit_control <- trainControl(method = "cv",
+                              number = 5,
+                              classProbs = TRUE,
+                              allowParallel = TRUE,
+                              summaryFunction = twoClassSummary)
+  
+  #Tests hyperpararamter grid to return optimal values
+  report1 <- train(features1, as.factor(make.names(labels1)),
+                   method = catboost.caret,
+                   logging_level = 'Verbose', preProc = NULL,
+                   tuneGrid = grid, trControl = fit_control)
+  
+  report2 <- train(features2, as.factor(make.names(labels2)),
+                   method = catboost.caret,
+                   logging_level = 'Verbose', preProc = NULL,
+                   tuneGrid = grid, trControl = fit_control)
+  
+  report3 <- train(features3, as.factor(make.names(labels3)),
+                   method = catboost.caret,
+                   logging_level = 'Verbose', preProc = NULL,
+                   tuneGrid = grid, trControl = fit_control)
+  
+  saveRDS(report1, file = "food_catBoost_hyperparameter_grid.rds")
+  saveRDS(report2, file = "misc_catBoost_hyperparameter_grid.rds")
+  saveRDS(report3, file = "cash_catBoost_hyperparameter_grid.rds")
+  print(report1)
+  print(report2)
+  print(report3)
+  
+}else{
+  report1 <- readRDS("food_catBoost_hyperparameter_grid.rds")
+  report2 <- readRDS("misc_catBoost_hyperparameter_grid.rds")
+  report3 <- readRDS("cash_catBoost_hyperparameter_grid.rds")
+}
+
+#Returns feature importance
+importance1 <- varImp(report1, scale = FALSE)
+importance2 <- varImp(report2, scale = FALSE)
+importance3 <- varImp(report3, scale = FALSE)
+print(importance1)
+print(importance2)
+print(importance3)
+
+#visualize feature importance
+ggplot(importance1, aes(x = reorder(row.names(importance1), Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "dodgerblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Feature", y = "Importance", title = "Feature Importance")
+
+ggplot(importance2, aes(x = reorder(row.names(importance2), Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "dodgerblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Feature", y = "Importance", title = "Feature Importance")
+
+ggplot(importance3, aes(x = reorder(row.names(importance3), Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "dodgerblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Feature", y = "Importance", title = "Feature Importance")
+
+#List of tuned parameters for training final model
+#overfitting parameters iterative, stops after no increase with 20 iterations
+#Original Paramters 1000, 0.15, 8. 0.3, 0.9, 256, Logloss
+#Food Parameters 1000, 0.3, 9. 0.3, 0.9, 256, Logloss
+#Misc parameters 1000, 0.25, 7, 0.2, 0.9, 256
+if(genCat){
+  opt_params1 <- list(iterations=1000,
+                      learning_rate=0.25,
+                      depth=9,
+                      l2_leaf_reg = 0.3,
+                      rsm = 0.95,
+                      border_count = 256,
+                      loss_function='Logloss',
+                      eval_metric='Logloss',
+                      random_seed = 123,
+                      od_type='Iter',
+                      bootstrap_type = 'MVS',
+                      od_wait=50,
+                      use_best_model=TRUE)
+  
+  opt_params2 <- list(iterations=1000,
+                      learning_rate=0.15,
+                      depth=9,
+                      l2_leaf_reg = 0.8,
+                      rsm = 0.95,
+                      border_count = 256,
+                      loss_function='Logloss',
+                      eval_metric='Logloss',
+                      random_seed = 123,
+                      od_type='Iter',
+                      bootstrap_type = 'MVS',
+                      od_wait=50,
+                      use_best_model=TRUE)
+  
+  opt_params3 <- list(iterations=1000,
+                      learning_rate=0.1,
+                      depth=9,
+                      l2_leaf_reg = 1.5,
+                      rsm = 0.7,
+                      border_count = 256,
+                      loss_function='Logloss',
+                      eval_metric='Logloss',
+                      random_seed = 123,
+                      od_type='Iter',
+                      bootstrap_type = 'MVS',
+                      od_wait=50,
+                      use_best_model=TRUE)
+  
+  food_catboost_model <- catboost.train(train_pool1, test_pool1, opt_params1)
+  misc_catboost_model <- catboost.train(train_pool2, test_pool2, opt_params2)
+  cash_catboost_model <- catboost.train(train_pool3, test_pool3, opt_params3)
+  #Make Predictions on test set for confusion matrix
+  #Thread count set to default processors, ntree_end equal to tree_count
+  testPredict1 <- catboost.predict(food_catboost_model,
+                                   test_pool1,
+                                   verbose=TRUE,
+                                   prediction_type='Probability',
+                                   ntree_start=0,
+                                   ntree_end=0,
+                                   thread_count=-1)
+  
+  testPredict2 <- catboost.predict(misc_catboost_model,
+                                   test_pool2,
+                                   verbose=TRUE,
+                                   prediction_type='Probability',
+                                   ntree_start=0,
+                                   ntree_end=0,
+                                   thread_count=-1)
+  
+  testPredict3 <- catboost.predict(cash_catboost_model,
+                                   test_pool3,
+                                   verbose=TRUE,
+                                   prediction_type='probability',
+                                   ntree_start=0,
+                                   ntree_end=0,
+                                   thread_count=-1)
+  
+  #Round probabilities to binary class labels
+  predicted_labels1 <- ifelse(testPredict1 >= 0.5, 1, 0)
+  predicted_labels2 <- ifelse(testPredict2 >= 0.5, 1, 0)
+  predicted_labels3 <- ifelse(testPredict3 >= 0.5, 1, 0)
+  
+  # Confusion matrix using rounded estimates
+  catCM1 <- confusionMatrix(as.factor(predicted_labels1), as.factor(test_labels1))
+  draw_confusion_matrix(catCM1, treatment = "CATBOOST FOOD SUPPORT CONFUSION MATRIX")
+  catCM2 <- confusionMatrix(as.factor(predicted_labels2), as.factor(test_labels2))
+  draw_confusion_matrix(catCM2, treatment = "CATBOOST MISC SUPPORT CONFUSION MATRIX")
+  catCM3 <- confusionMatrix(as.factor(predicted_labels3), as.factor(test_labels3))
+  draw_confusion_matrix(catCM3, treatment = "CATBOOST CASH SUPPORT CONFUSION MATRIX")
+  
+  #Propensity Score Prediction
+  estPropScoreCat1 <- catboost.predict(food_catboost_model,
+                                       treat_pool1,
+                                       verbose=TRUE,
+                                       prediction_type='Probability',
+                                       ntree_start=0,
+                                       ntree_end=0,
+                                       thread_count=-1)
+  saveRDS(estPropScoreCat1, file = "food_propScoreCat.rds")
+  
+  estPropScoreCat2 <- catboost.predict(misc_catboost_model,
+                                       treat_pool2,
+                                       verbose=TRUE,
+                                       prediction_type='Probability',
+                                       ntree_start=0,
+                                       ntree_end=0,
+                                       thread_count=-1)
+  saveRDS(estPropScoreCat2, file = "misc_propScoreCat.rds")
+  
+  estPropScoreCat3 <- catboost.predict(cash_catboost_model,
+                                       treat_pool3,
+                                       verbose=TRUE,
+                                       prediction_type='Probability',
+                                       ntree_start=0,
+                                       ntree_end=0,
+                                       thread_count=-1)
+  saveRDS(estPropScoreCat3, file = "cash_propScoreCat.rds")
+  
+}else{
+  estPropScoreCat1 <- readRDS("food_propScoreCat.rds")
+  estPropScoreCat2 <- readRDS("misc_propScoreCat.rds")
+  estPropScoreCat3 <- readRDS("cash_propScoreCat.rds")
+}
+
+
+
+##Performing matching
+if(genMatchesATE){
+  #Generates paired matches for average treatment effect
+  m.outLRATE1 <- matchit(formula = as.formula(formula_str1), data = data.mi, 
+                         method = "full", distance = 'glm', estimand = 'ATE',
+                         s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outLRATE1 <- add_s.weights(m.outLRATE1, ~hhweight)
+  saveRDS(m.outLRATE1, file = "food_m.outLRATE.rds")
+  
+  m.outLRATE2 <- matchit(formula = as.formula(formula_str2), data = data.mi, 
+                         method = "full", distance = 'glm', estimand = 'ATE',
+                         s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outLRATE2 <- add_s.weights(m.outLRATE2, ~hhweight)
+  saveRDS(m.outLRATE2, file = "misc_m.outLRATE.rds")
+  
+  m.outLRATE3 <- matchit(formula = as.formula(formula_str3), data = data.mi, 
+                         method = "full", distance = 'glm', estimand = 'ATE',
+                         s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outLRATE3 <- add_s.weights(m.outLRATE3, ~hhweight)
+  saveRDS(m.outLRATE3, file = "cash_m.outLRATE.rds")
+  
+  
+  
+  #Random forest propensity, full matching, survey weights as hhweight, probit link
+  m.outRFATE1 <- matchit(formula = as.formula(formula_str1), data = data.mi,
+                         method = "full", distance = estPropScoreRF1, estimand = 'ATE', 
+                         s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outRFATE1 <- add_s.weights(m.outRFATE1, ~hhweight)
+  saveRDS(m.outRFATE1, file = "food_m.outRFATE.rds")
+  
+  m.outRFATE2 <- matchit(formula = as.formula(formula_str2), data = data.mi,
+                         method = "full", distance = estPropScoreRF2, estimand = 'ATE', 
+                         s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outRFATE2 <- add_s.weights(m.outRFATE2, ~hhweight)
+  saveRDS(m.outRFATE2, file = "misc_m.outRFATE.rds")
+  
+  m.outRFATE3 <- matchit(formula = as.formula(formula_str3), data = data.mi,
+                         method = "full", distance = estPropScoreRF3, estimand = 'ATE', 
+                         s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outRFATE3 <- add_s.weights(m.outRFATE3, ~hhweight)
+  saveRDS(m.outRFATE3, file = "cash_m.outRFATE.rds")
+  
+  
+  
+  #Catboost propensity, full matching, survey weights as hhweight, probit link
+  m.outCatATE1 <- matchit(formula = as.formula(formula_str1), data = data.mi,
+                          method = "full", distance = estPropScoreCat1, estimand = 'ATE', 
+                          s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outCatATE1 <- add_s.weights(m.outCatATE1, ~hhweight)
+  saveRDS(m.outCatATE1, file = "food_m.outCatATE.rds")
+  
+  m.outCatATE2 <- matchit(formula = as.formula(formula_str2), data = data.mi,
+                          method = "full", distance = estPropScoreCat2, estimand = 'ATE', 
+                          s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outCatATE2 <- add_s.weights(m.outCatATE2, ~hhweight)
+  saveRDS(m.outCatATE2, file = "misc_m.outCatATE.rds")
+  
+  m.outCatATE3 <- matchit(formula = as.formula(formula_str3), data = data.mi,
+                          method = "full", distance = estPropScoreCat3, estimand = 'ATE', 
+                          s.weights=~hhweight, link = "logit", verbose = TRUE)
+  m.outCatATE3 <- add_s.weights(m.outCatATE3, ~hhweight)
+  saveRDS(m.outCatATE3, file = "cash_m.outCatATE.rds")
+}else{
+  m.outLRATE1 <- readRDS("food_m.outLRATE.rds")
+  m.outLRATE2 <- readRDS("misc_m.outLRATE.rds")
+  m.outLRATE3 <- readRDS("cash_m.outLRATE.rds")
+  
+  m.outRFATE1 <- readRDS("food_m.outRFATE.rds")
+  m.outRFATE2 <- readRDS("misc_m.outRFATE.rds")
+  m.outRFATE3 <- readRDS("cash_m.outRFATE.rds")
+  
+  m.outCatATE1 <- readRDS("food_m.outCatATE.rds")
+  m.outCatATE2 <- readRDS("misc_m.outCatATE.rds")
+  m.outCatATE3 <- readRDS("cash_m.outCatATE.rds")
+}
+
+
+#Creating matched treated and untreated groups for ATT
+if(genMatchesATT){
+  #Logistic regression propensity, full matching, survey weights as hhweight, probit link
+  #Use caliper of 0.25 if caliper matching
+  m.outLRATT1 <- matchit(formula = as.formula(formula_str1), data = data.mi, 
+                         method = "genetic", distance = 'glm', estimand = 'ATT',
+                         s.weights=~hhweight, link = "logit", verbose = TRUE, 
+                         ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outLRATT1 <- add_s.weights(m.outLRATT1, ~hhweight)
+  saveRDS(m.outLRATT1, file = "food_m.outLRATT.rds")
+  
+  m.outLRATT2 <- matchit(formula = as.formula(formula_str2), data = data.mi, 
+                         method = "genetic", distance = 'glm', estimand = 'ATT',
+                         s.weights=~hhweight, link = "logit", verbose = TRUE, 
+                         ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outLRATT2 <- add_s.weights(m.outLRATT2, ~hhweight)
+  saveRDS(m.outLRATT2, file = "misc_m.outLRATT.rds")
+  
+  m.outLRATT3 <- matchit(formula = as.formula(formula_str3), data = data.mi, 
+                         method = "genetic", distance = 'glm', estimand = 'ATT',
+                         s.weights=~hhweight, link = "probit", verbose = TRUE, 
+                         ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outLRATT3 <- add_s.weights(m.outLRATT3, ~hhweight)
+  saveRDS(m.outLRATT3, file = "cash_m.outLRATT.rds")
+  
+  
+  
+  #Random forest propensity, opt matching, survey weights as hhweight, probit link
+  m.outRFATT1 <- matchit(formula = as.formula(formula_str1), data = data.mi,
+                         method = "nearest", distance = estPropScoreRF1, estimand = 'ATT', 
+                         s.weights=~hhweight, link = "logit", verbose = TRUE, 
+                         ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outRFATT1 <- add_s.weights(m.outRFATT1, ~hhweight)
+  saveRDS(m.outRFATT1, file = "food_m.outRFATT.rds")
+  
+  #opt
+  m.outRFATT2 <- matchit(formula = as.formula(formula_str2), data = data.mi,
+                         method = "nearest", distance = estPropScoreRF2, estimand = 'ATT', 
+                         s.weights=~hhweight, link = "probit", verbose = TRUE, 
+                         ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outRFATT2 <- add_s.weights(m.outRFATT2, ~hhweight)
+  saveRDS(m.outRFATT2, file = "misc_m.outRFATT.rds")
+  
+  m.outRFATT3 <- matchit(formula = as.formula(formula_str3), data = data.mi,
+                         method = "nearest", distance = estPropScoreRF3, estimand = 'ATT', 
+                         s.weights=~hhweight, link = "probit", verbose = TRUE, 
+                         ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outRFATT3 <- add_s.weights(m.outRFATT3, ~hhweight)
+  saveRDS(m.outRFATT3, file = "cash_m.outRFATT.rds")
+  
+  #Catboost propensity, opt matching, survey weights as hhweight, probit link
+  m.outCatATT1 <- matchit(formula = as.formula(formula_str1), data = data.mi,
+                          method = "nearest", distance = estPropScoreCat1, estimand = 'ATT', 
+                          s.weights=~hhweight, link = "probit", verbose = TRUE, 
+                          ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outCatATT1 <- add_s.weights(m.outCatATT1, ~hhweight)
+  saveRDS(m.outCatATT1, file = "food_m.outCatATT.rds")
+  
+  m.outCatATT2 <- matchit(formula = as.formula(formula_str2), data = data.mi,
+                          method = "nearest", distance = estPropScoreCat2, estimand = 'ATT', 
+                          s.weights=~hhweight, link = "logit", verbose = TRUE, 
+                          ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outCatATT2 <- add_s.weights(m.outCatATT2, ~hhweight)
+  saveRDS(m.outCatATT2, file = "misc_m.outCatATT.rds")
+  
+  m.outCatATT3 <- matchit(formula = as.formula(formula_str3), data = data.mi,
+                          method = "nearest", distance = estPropScoreCat3, estimand = 'ATT', 
+                          s.weights=~hhweight, link = "logit", verbose = TRUE, 
+                          ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
+  m.outCatATT3 <- add_s.weights(m.outCatATT3, ~hhweight)
+  saveRDS(m.outCatATT3, file = "cash_m.outCatATT.rds")
+}else{
+  m.outLRATT1 <- readRDS("food_m.outLRATT.rds")
+  m.outLRATT2 <- readRDS("misc_m.outLRATT.rds")
+  m.outLRATT3 <- readRDS("cash_m.outLRATT.rds")
+  
+  m.outRFATT1 <- readRDS("food_m.outRFATT.rds")
+  m.outRFATT2 <- readRDS("misc_m.outRFATT.rds")
+  m.outRFATT3 <- readRDS("cash_m.outRFATT.rds")
+  
+  m.outCatATT1 <- readRDS("food_m.outCatATT.rds")
+  m.outCatATT2 <- readRDS("misc_m.outCatATT.rds")
+  m.outCatATT3 <- readRDS("cash_m.outCatATT.rds")
+}
+
+
+if(matchSummary){
+  #Returns summary of matchit groups
+  summary(m.outLRATT1, standardize=TRUE, un = FALSE)
+  summary(m.outLRATT2, standardize=TRUE, un = FALSE)
+  summary(m.outLRATT3, standardize=TRUE, un = FALSE)
+  
+  summary(m.outRFATT1, standardize=TRUE, un = FALSE)
+  summary(m.outRFATT2, standardize=TRUE, un = FALSE)
+  summary(m.outRFATT3, standardize=TRUE, un = FALSE)
+  
+  summary(m.outCatATT1, standardize=TRUE, un = FALSE)
+  summary(m.outCatATT2, standardize=TRUE, un = FALSE)
+  summary(m.outCatATT3, standardize=TRUE, un = FALSE)
+  #Plot of control and treated groups used and unused echelons
+  plot(m.outLRATT1, type = "jitter", interactive = FALSE)
+  plot(m.outRFATT1, type = "jitter", interactive = FALSE)
+  plot(m.outCatATT1, type = "jitter", interactive = FALSE)
+}
+
+#Creates matched data
+m.dataLR1 <- match.data(m.outLRATT1, include.s.weights = TRUE)
+m.dataLR2 <- match.data(m.outLRATT2, include.s.weights = TRUE)
+m.dataLR3 <- match.data(m.outLRATT3, include.s.weights = TRUE)
+
+m.dataRF1 <- match.data(m.outRFATT1, include.s.weights = TRUE)
+m.dataRF2 <- match.data(m.outRFATT2, include.s.weights = TRUE)
+m.dataRF3 <- match.data(m.outRFATT3, include.s.weights = TRUE)
+
+m.dataCat1 <- match.data(m.outCatATT1, include.s.weights = TRUE)
+m.dataCat2 <- match.data(m.outCatATT2, include.s.weights = TRUE)
+m.dataCat3 <- match.data(m.outCatATT3, include.s.weights = TRUE)
+
+#Redundant check that there are no NA values in the data (caused by errors)
+NAm.data <- apply(m.dataLR1, 2, function(x){ sum(is.na(x)) })
+if (any(NAm.data != 0)) stop("Error: Missing values found in data.mi")
+
+#Cobalt Balance Testing, m.threshold is SMD, v.threshold is variance ratio
+#Food Support
+food_SMD_balanceLR <- bal.tab(m.outLRATT1, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+food_VR_balanceLR <- bal.tab(m.outLRATT1, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                             disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+food_SMD_balanceRF <- bal.tab(m.outRFATT1, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+food_VR_balanceRF <- bal.tab(m.outRFATT1, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                             disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+food_SMD_balanceCat <- bal.tab(m.outCatATT1, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                               disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+food_VR_balanceCat <- bal.tab(m.outCatATT1, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+
+#Misc Support
+misc_SMD_balanceLR <- bal.tab(m.outLRATT2, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+misc_VR_balanceLR <- bal.tab(m.outLRATT2, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                             disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+misc_SMD_balanceRF <- bal.tab(m.outRFATT2, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+misc_VR_balanceRF <- bal.tab(m.outRFATT2, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                             disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+misc_SMD_balanceCat <- bal.tab(m.outCatATT2, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                               disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+misc_VR_balanceCat <- bal.tab(m.outCatATT2, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+
+#Cash Support
+cash_SMD_balanceLR <- bal.tab(m.outLRATT3, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+cash_VR_balanceLR <- bal.tab(m.outLRATT3, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                             disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+cash_SMD_balanceRF <- bal.tab(m.outRFATT3, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+cash_VR_balanceRF <- bal.tab(m.outRFATT3, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                             disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+cash_SMD_balanceCat <- bal.tab(m.outCatATT3, s.d.denom = "treated", m.threshold = 0.2, un = TRUE,
+                               disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+cash_VR_balanceCat <- bal.tab(m.outCatATT3, s.d.denom = "treated", v.threshold = 2, un = TRUE,
+                              disp = c("means", "sds"), stats = c("mean.diffs", "variance.ratios"))
+
+print(food_SMD_balanceLR)
+print(food_SMD_balanceRF)
+print(food_SMD_balanceCat)
+
+print(misc_SMD_balanceLR)
+print(misc_SMD_balanceRF)
+print(misc_SMD_balanceCat)
+
+print(cash_SMD_balanceLR)
+print(cash_SMD_balanceRF)
+print(cash_SMD_balanceCat)
+#logit 79,0 77,2 67,12 79,0 75,4 57,21, 77/2 64,14 53,25
+#probit 79,0 77/2, 68,11 79,0 75,4 56,22 79,0 64,14 NA
+#Optimal 73/5, 71/7 NA 79/0 76/2 79/0 77/1 NA
+
+#Plots unmatched and matched balance of covariate levels for each model
+#Plotting food treatment balance
+if(plotLove){
+  loveLim <- c(-2, 5)
+  loveLR1 <- love.plot(bal.tab(m.outLRATT1, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+            grid=TRUE, stars="raw", abs = F)
+  love_plotLR1 <- loveLR1 + scale_x_continuous(limits = loveLim)
+  
+  loveRF1 <- love.plot(bal.tab(m.outRFATT1, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+            grid=TRUE, stars="raw", abs = F)
+  love_plotRF1 <- loveRF1 + scale_x_continuous(limits = loveLim)
+  
+  loveCat1 <- love.plot(bal.tab(m.outCatATT1, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+                            grid=TRUE, stars="raw", abs = F)
+  love_plotCat1 <- loveCat1 + scale_x_continuous(limits = loveLim)
+  
+  
+  #Plotting misc treatment balance
+  loveLR2 <-love.plot(bal.tab(m.outLRATT2, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+            grid=TRUE, stars="raw", abs = F)
+  love_plotLR2<- loveLR2 + scale_x_continuous(limits = loveLim)
+  
+  loveRF2 <- love.plot(bal.tab(m.outRFATT2, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+            grid=TRUE, stars="raw", abs = F)
+  love_plotRF2 <- loveRF2 + scale_x_continuous(limits = loveLim)
+  
+  loveCat2 <- love.plot(bal.tab(m.outCatATT2, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+            grid=TRUE, stars="raw", abs = F)
+  love_plotCat2 <- loveCat2 + scale_x_continuous(limits = loveLim)
+  
+  #Plotting Cash treatment balance
+  loveLR3 <- love.plot(bal.tab(m.outLRATT3, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+           grid=TRUE, stars="raw", abs = F)
+  love_plotLR3<- loveLR3 + scale_x_continuous(limits = loveLim)
+  
+  loveRF3 <- love.plot(bal.tab(m.outRFATT3, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+            grid=TRUE, stars="raw", abs = F)
+  love_plotRF3 <- loveRF3 + scale_x_continuous(limits = loveLim)
+  
+  loveCat3 <- love.plot(bal.tab(m.outCatATT3, m.threshold=0.2, s.d.denom = "treated"), stat = "mean.diffs",
+            grid=TRUE, stars="raw", abs = F)
+  love_plotCat3 <- loveCat3 + scale_x_continuous(limits = loveLim)
+  
+  print(love_plotLR1)
+  print(love_plotRF1)
+  print(love_plotCat1)
+  
+  print(love_plotLR2)
+  print(love_plotRF2)
+  print(love_plotCat2)
+  
+  print(love_plotLR3)
+  print(love_plotRF3)
+  print(love_plotCat3)
+  }
+
+##Table One Matched
+if(oneTable){
+  food_tableOneMLR <- one_table(m.dataLR1, oneTableVar, oneTablefactorVar, treatmentVariable1)
+  write.csv(food_tableOneMLR, file = "food_tableOne_after_LRmatching.csv")
+  food_tableOneMRF <- one_table(m.dataRF1, oneTableVar, oneTablefactorVar, treatmentVariable1)
+  write.csv(food_tableOneMRF, file = "food_tableOne_after_RFmatching.csv")
+  food_tableOneMCat <- one_table(m.dataCat1, oneTableVar, oneTablefactorVar, treatmentVariable1)
+  write.csv(food_tableOneMCat, file = "food_tableOne_after_Catmatching.csv")
+  
+  misc_tableOneMLR <- one_table(m.dataLR2, oneTableVar, oneTablefactorVar, treatmentVariable2)
+  write.csv(misc_tableOneMLR, file = "misc_tableOne_after_LRmatching.csv")
+  cash_tableOneMLR <- one_table(m.dataLR3, oneTableVar, oneTablefactorVar, treatmentVariable3)
+  write.csv(cash_tableOneMLR, file = "cash_tableOne_after_LRmatching.csv")
+}
+##ATT estimation
+#Revised formula string that includes treatment variable
+formulaOutcome_str1 <- paste0(outcomeVariable, " ~ ", treatmentVariable1, " + age_c + ",
+                              "female_i + evrenrl_i + schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + ",
+                              "headage_c + headsex_i + headedu_i + headreligion_i + caredis_i + livarr_i + ",
+                              "relation_i + orph_cat + hhsize_c + area_i + province_i + wscore + windex5 + ",
+                              "hhweight + psu")
+
+formulaOutcome_str2 <- paste0(outcomeVariable, " ~ ", treatmentVariable2, " + age_c + ",
+                              "female_i + evrenrl_i + schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + ",
+                              "headage_c + headsex_i + headedu_i + headreligion_i + caredis_i + livarr_i + ",
+                              "relation_i + orph_cat + hhsize_c + area_i + province_i + wscore + windex5 + ",
+                              "hhweight + psu")
+
+formulaOutcome_str3 <- paste0(outcomeVariable, " ~ ", treatmentVariable3, " + age_c + ",
+                              "female_i + evrenrl_i + schpvyr_i + schpvyrl_i + schpvyrgrd_c + schpvyrlg_c + ",
+                              "headage_c + headsex_i + headedu_i + headreligion_i + caredis_i + livarr_i + ",
+                              "relation_i + orph_cat + hhsize_c + area_i + province_i + wscore + windex5 + ",
+                              "hhweight + psu")
+
+##Ensures that matched data does not have outcome or treatment variable as factor
+m.dataLR1 <- convert_yes_no_to_binary(m.dataLR1, columns_to_convert = c(treatmentVariable1, outcomeVariable))
+#Creates a survey design to account for complex surveying
+svy_designLR1 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataLR1)
+#Fits survey glm on matched data with survey design
+fitLRATT1 <- svyglm(as.formula(formulaOutcome_str1), design = svy_designLR1, family = "quasibinomial")
+#Calulates ATT
+food_attLR <- avg_comparisons(fitLRATT1, variables = treatmentVariable1, 
+                              newdata = subset(m.dataLR1, get(treatmentVariable1)  == 1), 
+                              wts = "weights")
+food_alt_attLR <- calculate_ATT_summary(data = m.dataLR1, fit = fitLRATT1, treatmentVar = treatmentVariable1)
+
+m.dataLR2 <- convert_yes_no_to_binary(m.dataLR2, columns_to_convert = c(treatmentVariable2, outcomeVariable))
+svy_designLR2 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataLR2)
+fitLRATT2 <- svyglm(as.formula(formulaOutcome_str2), design = svy_designLR2, family = "quasibinomial")
+misc_attLR <- avg_comparisons(fitLRATT2, variables = treatmentVariable2, 
+                              newdata = subset(m.dataLR2, get(treatmentVariable2)  == 1), 
+                              wts = "weights")
+misc_alt_attLR <- calculate_ATT_summary(data = m.dataLR2, fit = fitLRATT2, treatmentVar = treatmentVariable2)
+
+m.dataLR3 <- convert_yes_no_to_binary(m.dataLR3, columns_to_convert = c(treatmentVariable3, outcomeVariable))
+svy_designLR3 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataLR3)
+fitLRATT3 <- svyglm(as.formula(formulaOutcome_str3), design = svy_designLR3, family = "quasibinomial")
+cash_attLR <- avg_comparisons(fitLRATT3, variables = treatmentVariable3, 
+                              newdata = subset(m.dataLR3, get(treatmentVariable3)  == 1), 
+                              wts = "weights")
+cash_alt_attLR <- calculate_ATT_summary(data = m.dataLR3, fit = fitLRATT3, treatmentVar = treatmentVariable3)
+
+
+#Random Forest ATT
+m.dataRF1 <- convert_yes_no_to_binary(m.dataRF1, columns_to_convert = c(treatmentVariable1, outcomeVariable))
+svy_designRF1 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataRF1)
+fitRFATT1 <- svyglm(as.formula(formulaOutcome_str1), design = svy_designRF1, family = "quasibinomial")
+food_attRF <- avg_comparisons(fitRFATT1, variables = treatmentVariable1, 
+                              newdata = subset(m.dataRF1, get(treatmentVariable1)  == 1), 
+                              wts = "weights")
+food_alt_attRF <- calculate_ATT_summary(data = m.dataRF1, fit = fitRFATT1, treatmentVar = treatmentVariable1)
+
+m.dataRF2 <- convert_yes_no_to_binary(m.dataRF2, columns_to_convert = c(treatmentVariable2, outcomeVariable))
+svy_designRF2 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataRF2)
+fitRFATT2 <- svyglm(as.formula(formulaOutcome_str2), design = svy_designRF2, family = "quasibinomial")
+misc_attRF <- avg_comparisons(fitRFATT2, variables = treatmentVariable2, 
+                              newdata = subset(m.dataRF2, get(treatmentVariable2)  == 1), 
+                              wts = "weights")
+misc_alt_attRF <- calculate_ATT_summary(data = m.dataRF2, fit = fitRFATT2, treatmentVar = treatmentVariable2)
+
+m.dataRF3 <- convert_yes_no_to_binary(m.dataRF3, columns_to_convert = c(treatmentVariable3, outcomeVariable))
+svy_designRF3 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataRF3)
+fitRFATT3 <- svyglm(as.formula(formulaOutcome_str3), design = svy_designRF3, family = "quasibinomial")
+cash_attRF <- avg_comparisons(fitRFATT3, variables = treatmentVariable3, 
+                              newdata = subset(m.dataRF3, get(treatmentVariable3)  == 1), 
+                              wts = "weights")
+cash_alt_attRF <- calculate_ATT_summary(data = m.dataRF3, fit = fitRFATT3, treatmentVar = treatmentVariable3)
+
+#Catboost Forest ATT
+m.dataCat1 <- convert_yes_no_to_binary(m.dataCat1, columns_to_convert = c(treatmentVariable1, outcomeVariable))
+svy_designCat1 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataCat1)
+fitCatATT1 <- svyglm(as.formula(formulaOutcome_str1), design = svy_designCat1, family = "quasibinomial")
+food_attCat <- avg_comparisons(fitCatATT1, variables = treatmentVariable1, 
+                               newdata = subset(m.dataCat1, get(treatmentVariable1)  == 1), 
+                               wts = "weights")
+food_alt_attCat <- calculate_ATT_summary(data = m.dataCat1, fit = fitCatATT1, treatmentVar = treatmentVariable1)
+
+m.dataCat2 <- convert_yes_no_to_binary(m.dataCat2, columns_to_convert = c(treatmentVariable2, outcomeVariable))
+svy_designCat2 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataCat2)
+fitCatATT2 <- svyglm(as.formula(formulaOutcome_str2), design = svy_designCat2, family = "quasibinomial")
+misc_attCat <- avg_comparisons(fitCatATT2, variables = treatmentVariable2, 
+                               newdata = subset(m.dataCat2, get(treatmentVariable2)  == 1), 
+                               wts = "weights")
+misc_alt_attCat <- calculate_ATT_summary(data = m.dataCat2, fit = fitCatATT2, treatmentVar = treatmentVariable2)
+
+m.dataCat3 <- convert_yes_no_to_binary(m.dataCat3, columns_to_convert = c(treatmentVariable3, outcomeVariable))
+svy_designCat3 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~hhweight, data = m.dataCat3)
+fitCatATT3 <- svyglm(as.formula(formulaOutcome_str3), design = svy_designCat3, family = "quasibinomial")
+cash_attCat <- avg_comparisons(fitCatATT3, variables = treatmentVariable3, 
+                               newdata = subset(m.dataCat3, get(treatmentVariable3)  == 1), 
+                               wts = "weights")
+cash_alt_attCat <- calculate_ATT_summary(data = m.dataCat3, fit = fitCatATT3, treatmentVar = treatmentVariable3)
+
+#Printing ATT results for each treatment
+print(food_attLR)
+print(food_alt_attLR)
+print(food_attRF)
+print(food_attCat)
+
+print(misc_attLR)
+print(misc_alt_attLR)
+print(misc_attRF)
+print(misc_attCat)
+
+print(cash_attLR)
+print(cash_alt_attLR)
+print(cash_attRF)
+print(cash_attCat)
+
+#Creates contigency table to perform mcnemar test with treatment and outcome
+contingency_tableLR1 <- table(m.dataLR1[[treatmentVariable1]], m.dataLR1[[outcomeVariable]])
+contingency_tableLR2 <- table(m.dataLR2[[treatmentVariable2]], m.dataLR2[[outcomeVariable]])
+contingency_tableLR3 <- table(m.dataLR3[[treatmentVariable3]], m.dataLR3[[outcomeVariable]])
+
+#McNeamar significance test
+food_mcnemar_result <- mcnemar.test(contingency_tableLR1) 
+misc_mcnemar_result <- mcnemar.test(contingency_tableLR2)
+cash_mcnemar_result <- mcnemar.test(contingency_tableLR3)
+
+print(food_mcnemar_result)
+print(misc_mcnemar_result)
+print(cash_mcnemar_result)
+
+##Sensitivity testing
+#Rosenbaum
+gammaSet = 7; gammaIncSet = 1;
+food_sensitivityLR <- calculate_sensitivity(data = m.dataRF1, matchit_result = m.outLRATT1, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+misc_sensitivityLR <- calculate_sensitivity(data = m.dataRF2, matchit_result = m.outLRATT2, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+cash_sensitivityLR <- calculate_sensitivity(data = m.dataRF3, matchit_result = m.outLRATT3, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+
+#Random Forest sensitivity
+food_sensitivityRF <- calculate_sensitivity(data = m.dataLR1, matchit_result = m.outRFATT1, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+misc_sensitivityRF <- calculate_sensitivity(data = m.dataLR2, matchit_result = m.outRFATT2, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+cash_sensitivityRF <- calculate_sensitivity(data = m.dataLR3, matchit_result = m.outRFATT3, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+
+#CatBoost sensitivity
+food_sensitivityCat <- calculate_sensitivity(data = m.dataCat1, matchit_result = m.outCatATT1, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+misc_sensitivityCat <- calculate_sensitivity(data = m.dataCat2, matchit_result = m.outCatATT2, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+cash_sensitivityCat <- calculate_sensitivity(data = m.dataCat3, matchit_result = m.outCatATT3, outcomeVariable = outcomeVariable, gammaSet, gammaIncSet)
+
+
+print(food_sensitivityLR)
+print(food_sensitivityRF)
+print(food_sensitivityCat)
+
+print(misc_sensitivityLR)
+print(misc_sensitivityRF)
+print(misc_sensitivityCat)
+
+print(cash_sensitivityLR)
+print(cash_sensitivityRF)
+print(cash_sensitivityCat)

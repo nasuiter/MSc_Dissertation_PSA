@@ -24,6 +24,18 @@ library(corrplot) #Makes correaltion plot for collinearity
 library(dplyr)
 library(catboost) #Used for CatBoost
 
+
+## Operation Toggle
+doKNNImp <- FALSE; doMIIMp <- TRUE; #KNN imputation and multiple imputation
+doAICTest <- FALSE;  #Stepwise AIC 
+hypertuningRF = FALSE; RFPCA = FALSE; genRF = TRUE; #Random forest tuning, creation, and ps
+catBoostBaseline = FALSE; genCat = TRUE; #CatBooost hyperparameters and ps
+genMatchesATE = FALSE; genMatchesATT = TRUE; #Creation of matches for ATT and ATE
+matchSummary <- FALSE; oneTable <- TRUE; #Balance metrics summary with interactions
+plotLove = TRUE;
+
+
+
 #Functions
 getwd()
 ##Function that returns the types of used parameters
@@ -321,21 +333,15 @@ calculate_sensitivity <- function(data, matchit_result, outcomeVariable, gammaSe
 }
 
 
+
+
+
 #Opening steps
 data <- read_dta('MICS_ZWE_Data.dta')
 data <- as.data.frame(data)
 data = filter(data, age_c > 9 & age_c < 20) #remove irrelevant ages
 data <- data[, !(names(data) %in% c("HHID", "ID"))] #Remove indivudal and household IDs
 data$misc12mn_i <- pmax(data$pens12mn_i, data$hlth12mn_i, data$oth12mn_i)
-#Operation Toggle
-doKNNImp <- FALSE; doMIIMp <- FALSE; #KNN imputation and multiple imputation
-doAICTest <- FALSE; testResiduals = FALSE; #Stepwise AIC and checks propGLM residuals
-hypertuningRF = FALSE; RFPCA = FALSE; genRF = FALSE; #Random forest tuning, creation, and ps
-catBoostBaseline = FALSE; genCat = FALSE; #CatBooost hyperparameters and ps
-genMatchesATE = FALSE; genMatchesATT = FALSE; #Creation of matches for ATT and ATE
-
-matchSummary <- FALSE; oneTable <- TRUE; #Balance metrics summary with interactions
-plotLove = FALSE;
 
 outcomeVariable <- "schcyr_i"
 # Categories: school (schlsprt_i), food (fdagr12mn_i), miscellaneous (misc12mn_i), 

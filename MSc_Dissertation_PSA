@@ -1,3 +1,4 @@
+#Libraries
 library(haven)
 library("tidyverse")
 library(ggplot2)
@@ -23,9 +24,303 @@ library(corrplot) #Makes correaltion plot for collinearity
 library(dplyr)
 library(catboost) #Used for CatBoost
 
+#Functions
 getwd()
-setwd("/Users/nathan/R")
-source("diss_functions.R")
+##Function that returns the types of used parameters
+get_column_types <- function(data) {
+  col_types <- sapply(data, function(col) {
+    if (is.factor(col)) {
+      "factor"
+    } else if (is.numeric(col)) {
+      "numeric"
+    } else if (is.logical(col)) {
+      "logical"
+    } else if (is.character(col)) {
+      "character"
+    } else {
+      "other"
+    }
+  })
+  return(col_types)
+}
+
+
+
+##Function to create OneTable
+one_table <- function(data, vars, factor_vars, strata) {
+  table_one <- CreateTableOne(
+    vars = vars,
+    data = data,
+    factorVars = factor_vars,
+    strata = strata,
+    smd = TRUE
+  )
+  
+  table_one <- print(table_one, smd = TRUE, showAllLevels = TRUE, noSpaces = TRUE, printToggle = FALSE)
+  return(table_one)
+}
+
+
+#Function to perform multiple imputation with rounding
+multiple_imputation <- function(data, method = "norm", m = 5, maxit = 50, seed = 123, 
+                                remove_collinear = FALSE, round_vars = NULL) {
+  # Convert labeled variables from Haven to regular numeric variables
+  data_no_labels <- as.data.frame(lapply(data, function(x) if (inherits(x, "haven_labelled")) as.numeric(x) else x))
+  
+  # Replace missing values with NA
+  data_no_labels[is.na(data_no_labels)] <- NA
+  
+  # Convert the data frame to numeric (if possible)
+  paramDF <- as.data.frame(lapply(data_no_labels, as.numeric))
+  
+  # Get the valid values for each variable
+  valid_values <- lapply(paramDF, function(var) unique(var[!is.na(var)]))
+  
+  # Perform multiple imputation
+  imputation_model <- mice(paramDF, method = method, m = m, maxit = maxit, seed = seed, 
+                           remove_collinear = remove_collinear)
+  
+  # Complete the imputed data
+  imputed_data <- complete(imputation_model)
+  
+  # Round imputed values to the nearest valid value within the range of valid values
+  if (!is.null(round_vars) && length(round_vars) > 0) {
+    for (var in round_vars) {
+      if (var %in% names(imputed_data)) {
+        if (is.numeric(imputed_data[[var]])) {
+          valid_range <- valid_values[[var]]
+          
+          # Find the nearest valid value for the variable within the valid range
+          round_func <- function(val) {
+            nearest_value <- min(max(val, min(valid_range)), max(valid_range))
+            return(nearest_value)
+          }
+          
+          imputed_data[[var]] <- sapply(imputed_data[[var]], round_func)
+        } else if (is.factor(imputed_data[[var]])) {
+          # Ensure imputed factor levels are within the valid range
+          valid_levels <- levels(data[[var]])
+          imputed_data[[var]] <- factor(imputed_data[[var]], levels = valid_levels)
+        }
+      }
+    }
+  }
+  
+  # Convert labeled variables back to Haven labeled variables (if applicable)
+  for (var in names(data)) {
+    if (inherits(data[[var]], "haven_labelled")) {
+      imputed_data[[var]] <- haven::labelled(imputed_data[[var]], levels(data[[var]]))
+    }
+  }
+  
+  return(imputed_data)
+}
+
+
+#MI rounding
+# Function to automatically round numeric columns to the nearest valid integer
+round_to_nearest_valid_in_column <- function(value, valid_values) {
+  nearest_value <- valid_values[which.min(abs(valid_values - value))]
+  return(nearest_value)
+}
+
+# Function to automatically round columns with non-integer values to the nearest valid integer
+round_integer_columns_in_mi <- function(imputed_data, original_data, integer_columns) {
+  for (col in integer_columns) {
+    if (col %in% colnames(imputed_data) && col %in% colnames(original_data)) {
+      valid_values <- unique(original_data[[col]][!is.na(original_data[[col]]) & original_data[[col]] %% 1 == 0])
+      imputed_data[[col]] <- sapply(imputed_data[[col]], round_to_nearest_valid_in_column, valid_values)
+    }
+  }
+  return(imputed_data)
+}
+
+
+## Function to inspect assumption of linearity in the logit
+visual_inspection_of_linearity <- function(propensity_scores, covariate_of_interest) {
+  # Compute the logit of the propensity scores
+  logit_propensity <- log(propensity_scores / (1 - propensity_scores))
+  
+  # Create a data frame with the logit of the propensity scores and the covariate of interest
+  data_to_plot <- data.frame(LogitPropensity = logit_propensity, Covariate = covariate_of_interest)
+  
+  # Create a scatterplot
+  ggplot(data_to_plot, aes(x = Covariate, y = LogitPropensity)) +
+    geom_point() +
+    geom_smooth(method = "lowess", se = FALSE) +  # Add a lowess curve
+    xlab("Covariate of Interest") +
+    ylab("Logit of Propensity Score") +
+    ggtitle("Visual Inspection of Linearity in Logit")
+}
+
+
+## Function to find the best GLM with interactions based on AIC
+find_best_glm <- function(data, formula_str, exclude_vars = NULL) {
+  # Remove excluded variables, if any
+  if (!is.null(exclude_vars)) {
+    data <- data[, !(names(data) %in% exclude_vars)]
+  }
+  
+  # Get response variable from the formula
+  response <- all.vars(formula_str)[1]
+  
+  # Generate all possible combinations of interaction terms (only when there are at least 2 predictors)
+  predictors <- all.vars(formula_str)[-1]
+  interaction_terms <- NULL
+  if (length(predictors) >= 2) {
+    interaction_terms <- combn(predictors, 2, function(x) paste(x[1], "*", x[2]), simplify = FALSE)
+  }
+  
+  # Create an empty list to store the fitted models and AIC values
+  models <- list()
+  aic_values <- numeric()
+  
+  # Fit GLMs with interaction terms and calculate AIC for each model
+  if (is.null(interaction_terms)) {
+    # If no interaction terms, fit the model with the given formula
+    formula <- as.formula(formula_str)
+    model <- glm(formula, data = data, family = binomial)
+    
+    # Store the model and its AIC value
+    models[[1]] <- model
+    aic_values <- AIC(model)
+  } else {
+    for (term in interaction_terms) {
+      updated_formula_str <- paste(response, "~ . +", paste(term, collapse = " + "))
+      formula <- rlang::parse_expr(updated_formula_str)
+      model <- glm(formula, data = data, family = binomial)
+      
+      # Store the model and its AIC value
+      models[[length(models) + 1]] <- model
+      aic_values <- c(aic_values, AIC(model))
+    }
+  }
+  # Find the model with the lowest AIC
+  best_model <- models[[which.min(aic_values)]]
+  
+  # Return the best model
+  return(best_model)
+}
+
+
+## Function to Convert categorical variables back to binary
+convert_yes_no_to_binary <- function(data, columns_to_convert) {
+  for (var in columns_to_convert) {
+    # Check if the variable is a factor with levels "Yes" and "No"
+    if (is.factor(data[[var]]) && all(levels(data[[var]]) %in% c("Yes", "No"))) {
+      # Convert "Yes" to 1 and "No" to 0
+      data[[var]] <- ifelse(data[[var]] == "Yes", 1, 0)
+    }
+  }
+  
+  return(data)
+}
+
+
+## Function for drawing confusion matrix
+draw_confusion_matrix <- function(cm, treatment) {
+  
+  layout(matrix(c(1,1,2)))
+  par(mar=c(0.1,0.1,2,0.1))
+  plot(c(100, 345), c(300, 450), type = "n", xlab="", ylab="", xaxt='n', yaxt='n')
+  title(treatment, cex.main=2)
+  
+  # create the matrix 
+  rect(150, 430, 240, 370, col='#3F97D0')
+  text(195, 435, 'Untreated', cex=1.2)
+  rect(250, 430, 340, 370, col='#F7AD50')
+  text(295, 435, 'treated', cex=1.2)
+  text(125, 370, 'Predicted', cex=1.3, srt=90, font=2)
+  text(245, 450, 'Actual', cex=1.3, font=2)
+  rect(150, 305, 240, 365, col='#F7AD50')
+  rect(250, 305, 340, 365, col='#3F97D0')
+  text(140, 400, 'Untreated', cex=1.2, srt=90)
+  text(140, 335, 'treated', cex=1.2, srt=90)
+  
+  # add in the cm results 
+  res <- as.numeric(cm$table)
+  text(195, 400, res[1], cex=1.6, font=2, col='white')
+  text(195, 335, res[2], cex=1.6, font=2, col='white')
+  text(295, 400, res[3], cex=1.6, font=2, col='white')
+  text(295, 335, res[4], cex=1.6, font=2, col='white')
+}  
+
+
+## Funcion to an alternate way to verify ATT results
+calculate_ATT_summary <- function(data, fit, treatmentVar) {
+  # Subset the data to include only treated individuals
+  treated_data <- subset(data, get(treatmentVar) == 1)
+  
+  # Extract coefficient and standard error for the treatment variable
+  ATT_estimate <- coef(fit)[treatmentVar]
+  ATT_SE <- sqrt(vcov(fit)[treatmentVar, treatmentVar])
+  
+  # Calculate the z-score
+  z_score <- ATT_estimate / ATT_SE
+  
+  # Calculate the p-value (two-tailed)
+  p_value <- 2 * (1 - pnorm(abs(z_score)))
+  
+  # Calculate the 95% confidence interval
+  conf_low <- ATT_estimate - 1.96 * ATT_SE
+  conf_high <- ATT_estimate + 1.96 * ATT_SE
+  
+  # Create a data frame with the values
+  result <- data.frame(
+    Contrast = "1 - 0",
+    Estimate = ATT_estimate,
+    `Std.Error` = ATT_SE,
+    `z` = z_score,
+    `Pr(>|z|)` = p_value,
+    `2.5 %` = conf_low,
+    `97.5 %` = conf_high
+  )
+  colnames(result) <- c("Contrast", "Estimate", "Std. Error", "z", "Pr(>|z|)", "2.5 %", "97.5 %")
+  return(result)
+}
+
+
+## Function for sensitivity analysis
+calculate_sensitivity <- function(matched_data, outcomeVariable, gammaSet = 6, gammaIncSet = 1) {
+  # Extract paired data
+  m.pairs <- cbind(
+    matched_data[row.names(matched_data), outcomeVariable],
+    matched_data[match.matrix, outcomeVariable]
+  )
+  
+  # Calculate x and y
+  x <- sum((m.pairs[, 1] == FALSE) & (m.pairs[, 2] == TRUE))
+  y <- sum((m.pairs[, 1] == TRUE) & (m.pairs[, 2] == FALSE))
+  
+  # Calculate sensitivity
+  sensitivity <- binarysens(x = x, y = y, Gamma = gammaSet, GammaInc = gammaIncSet)
+  
+  return(sensitivity)
+}
+
+
+#Function to calculate Rosenbaum's sensitivity
+calculate_sensitivity <- function(data, matchit_result, outcomeVariable, gammaSet, gammaIncSet) {
+  # Extract the matched dataset using match.matrix
+  matched_data <- data[matchit_result$match.matrix, ]
+  
+  # Create m.pairs matrix
+  m.pairs <- cbind(
+    matched_data[, outcomeVariable],
+    data[matchit_result$match.matrix, outcomeVariable]
+  )
+  
+  # Calculate x and y
+  x <- sum((m.pairs[, 1] == FALSE) & (m.pairs[, 2] == TRUE))
+  y <- sum((m.pairs[, 1] == TRUE) & (m.pairs[, 2] == FALSE))
+  
+  # Calculate sensitivity
+  sensitivity <- binarysens(x = x, y = y, Gamma = gammaSet, GammaInc = gammaIncSet)
+  
+  return(sensitivity)
+}
+
+
 #Opening steps
 data <- read_dta('MICS_ZWE_Data.dta')
 data <- as.data.frame(data)

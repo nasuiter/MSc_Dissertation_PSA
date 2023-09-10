@@ -1108,21 +1108,21 @@ if(genMatchesATT){
   #Logistic regression propensity, full matching, survey weights as hhweight, probit link
   #Use caliper of 0.25 if caliper matching
   m.outLRATT1 <- matchit(formula = as.formula(formula_str1), data = data.mi, 
-                         method = "genetic", distance = 'glm', estimand = 'ATT',
+                         method = "full", distance = 'glm', estimand = 'ATT',
                          s.weights=~hhweight, link = "logit", verbose = TRUE, 
                          ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
   m.outLRATT1 <- add_s.weights(m.outLRATT1, ~hhweight)
   saveRDS(m.outLRATT1, file = "food_m.outLRATT.rds")
   
   m.outLRATT2 <- matchit(formula = as.formula(formula_str2), data = data.mi, 
-                         method = "genetic", distance = 'glm', estimand = 'ATT',
+                         method = "full", distance = 'glm', estimand = 'ATT',
                          s.weights=~hhweight, link = "logit", verbose = TRUE, 
                          ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
   m.outLRATT2 <- add_s.weights(m.outLRATT2, ~hhweight)
   saveRDS(m.outLRATT2, file = "misc_m.outLRATT.rds")
   
   m.outLRATT3 <- matchit(formula = as.formula(formula_str3), data = data.mi, 
-                         method = "genetic", distance = 'glm', estimand = 'ATT',
+                         method = "full", distance = 'glm', estimand = 'ATT',
                          s.weights=~hhweight, link = "probit", verbose = TRUE, 
                          ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
   m.outLRATT3 <- add_s.weights(m.outLRATT3, ~hhweight)
@@ -1155,24 +1155,24 @@ if(genMatchesATT){
   
   #Catboost propensity, opt matching, survey weights as hhweight, probit link
   m.outCatATT1 <- matchit(formula = as.formula(formula_str1), data = data.mi,
-                          method = "nearest", distance = estPropScoreCat1, estimand = 'ATT', 
+                          method = "full", distance = estPropScoreCat1, estimand = 'ATT', 
                           s.weights=~hhweight, link = "probit", verbose = TRUE, 
                           ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
   m.outCatATT1 <- add_s.weights(m.outCatATT1, ~hhweight)
   saveRDS(m.outCatATT1, file = "food_m.outCatATT.rds")
   
   m.outCatATT2 <- matchit(formula = as.formula(formula_str2), data = data.mi,
-                          method = "nearest", distance = estPropScoreCat2, estimand = 'ATT', 
+                          method = "full", distance = estPropScoreCat2, estimand = 'ATT', 
                           s.weights=~hhweight, link = "logit", verbose = TRUE, 
                           ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
   m.outCatATT2 <- add_s.weights(m.outCatATT2, ~hhweight)
   saveRDS(m.outCatATT2, file = "misc_m.outCatATT.rds")
   
   m.outCatATT3 <- matchit(formula = as.formula(formula_str3), data = data.mi,
-                          method = "nearest", distance = estPropScoreCat3, estimand = 'ATT', 
+                          method = "full", distance = estPropScoreCat3, estimand = 'ATT', 
                           s.weights=~hhweight, link = "logit", verbose = TRUE, 
                           ratio = 1, caliper = 0.25, pop.size=1000, fit.func="pvals")
-  m.outCatATT3 <- add_s.weights(m.outCatATT3, ~hhweight)
+  m.outCatATT3 <- add_s.weights(m.outCatAfTT3, ~hhweight)
   saveRDS(m.outCatATT3, file = "cash_m.outCatATT.rds")
 }else{
   m.outLRATT1 <- readRDS("food_m.outLRATT.rds")
